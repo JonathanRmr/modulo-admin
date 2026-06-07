@@ -1,0 +1,1002 @@
+at > /mnt/user-data/outputs/barbertime_documentacion.txt << 'EOF'
+╔══════════════════════════════════════════════════════════════════════════════════╗
+║                        BARBERTIME — DOCUMENTACIÓN COMPLETA                     ║
+║                    Sistema de gestión de barbería (microservicios)             ║
+╚══════════════════════════════════════════════════════════════════════════════════╝
+
+Fecha de documentación: Junio 2026
+Módulos: Usuarios (5000), Servicios (4002), Citas (4003), Admin (4004)
+Estado: Todos los módulos analizados
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. ARQUITECTURA GENERAL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+BarberTime es un sistema de gestión de barbería construido con arquitectura de
+microservicios. Cada módulo es una aplicación Node.js/Express independiente con
+su propia base de datos MongoDB.
+
+MÓDULOS Y PUERTOS
+─────────────────
+  Módulo Usuarios    → puerto 5000  (LISTO)
+  Módulo Servicios   → puerto 4002  (LISTO)
+  Módulo Citas       → puerto 4003  (LISTO)
+  Módulo Admin       → puerto 4004  (LISTO)
+  Frontend           → puerto libre (POR DESARROLLAR)
+
+STACK TECNOLÓGICO
+─────────────────
+  Runtime:           Node.js
+  Framework:         Express
+  Base de datos:     MongoDB Atlas (cada módulo con su propia BD)
+  Auth:              JWT — jsonwebtoken + bcrypt para contraseñas
+  Validación:        Joi (módulo usuarios) / validación manual (otros módulos)
+  HTTP entre módulos: axios (módulo admin → servicios y citas)
+  Variables de entorno: dotenv
+
+PRINCIPIO SHARED-NOTHING
+─────────────────────────
+Ningún módulo comparte base de datos con otro. Cada uno tiene su propia colección
+en MongoDB. La comunicación entre módulos se hace por HTTP, no por consultas
+directas a la BD ajena.
+
+  barbertime_usuarios  → exclusiva del módulo usuarios
+  barbertime_servicios → exclusiva del módulo servicios
+  barbertime_citas     → exclusiva del módulo citas
+  barbertime_admin     → exclusiva del módulo admin
+
+JWT — EL PEGAMENTO DEL SISTEMA
+────────────────────────────────
+El módulo de usuarios emite el token en login/registro. Todos los demás módulos
+lo verifican localmente sin consultar al módulo de usuarios, usando el mismo
+JWT_SECRET.
+
+⚠️  INCOMPATIBILIDAD CRÍTICA — LEER ANTES DE INTEGRAR ⚠️
+───────────────────────────────────────────────────────────
+El módulo de usuarios firma el JWT con este payload:
+  { "usuarioId": "...", "iat": ... }
+
+Los módulos de citas y admin esperan en el payload:
+  { "id": "...", "tipoUsuario": "admin|barbero|cliente", ... }
+
+ESTO SIGNIFICA QUE HOY EL SISTEMA NO PUEDE INTEGRARSE SIN UNA CORRECCIÓN.
+El módulo admin verifica tipoUsuario === "admin" para permitir el acceso, pero
+ese campo no viene en el token que emite el módulo de usuarios.
+
+CORRECCIÓN NECESARIA EN AuthService.js del módulo usuarios:
+  // Cambiar esto:
+  generarToken(usuarioId) {
+      return jwt.sign(
+          { usuarioId, iat: Date.now() },
+          process.env.JWT_SECRET,
+          { expiresIn: process.env.JWT_EXPIRY || '7d' }
+      );
+  }
+
+  // Por esto:
+  generarToken(usuarioId, tipoUsuario) {
+      return jwt.sign(
+          { id: usuarioId, tipoUsuario, iat: Date.now() },
+          process.env.JWT_SECRET,
+          { expiresIn: process.env.JWT_EXPIRY || '7d' }
+      );
+  }
+
+  Y en el método login() pasar el tipoUsuario:
+  const token = this.generarToken(usuario._id, usuario.tipoUsuario);
+
+  Y en el método registro() también:
+  const token = this.generarToken(usuario._id, usuario.tipoUsuario);
+
+SEGUNDO DETALLE — tipoUsuario en usuarios vs otros módulos
+──────────────────────────────────────────────────────────
+El modelo de usuarios tiene tipoUsuario con enum: ['cliente', 'admin', 'vendedor']
+Los módulos de citas y admin esperan: 'cliente' | 'admin' | 'barbero'
+
+El valor 'vendedor' no existe en los otros módulos. Si se va a usar el rol de
+barbero hay que decidir si se llama 'vendedor' o 'barbero' y unificarlo en todos
+los módulos. Recomendación: cambiar 'vendedor' por 'barbero' en el modelo de
+usuarios para mantener consistencia.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. MÓDULO USUARIOS (puerto 5000)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+RESPONSABILIDADES
+─────────────────
+  - Registro y login de usuarios
+  - Emisión de JWT (necesita corrección del payload — ver sección 1)
+  - Gestión de perfiles (actualizar, eliminar)
+  - Cambio de contraseña
+  - Verificación de email
+  - Listado de usuarios (solo admin)
+
+BASE DE DATOS: barbertime_usuarios
+───────────────────────────────────
+Variable de entorno: MONGODB_URI (ojo: este módulo usa MONGODB_URI, no MONGO_URI)
+
+Colección: usuarios
+  _id                ObjectId
+  id                 String   (único, sparse — campo adicional opcional)
+  nombres            String   (requerido, minlength: 2)
+  apellido           String   (opcional)
+  email              String   (requerido, único, lowercase)
+  contrasena         String   (requerido, minlength: 6, hasheada con bcrypt,
+                               select: false — no se devuelve en queries)
+  telefono           String   (opcional)
+  edad               Number   (opcional)
+  ciudad             String   (opcional)
+  estadoCuenta       String   (enum: 'activo'|'inactivo'|'suspendido', def: 'activo')
+  tipoUsuario        String   (enum: 'cliente'|'admin'|'vendedor', def: 'cliente')
+  fechaCreacion      Date     (default: ahora)
+  ultimaActualizacion Date    (default: ahora, se actualiza en cada PUT)
+  ultimaConexion     Date     (se actualiza en cada login)
+  verificado         Boolean  (default: false)
+  tokenVerificacion  String   (select: false)
+  resetToken         String   (select: false)
+  resetTokenExpira   Date     (select: false)
+
+NOTA: El campo contrasena nunca se devuelve en respuestas. El método
+perfilPublico() elimina contrasena, tokenVerificacion, resetToken y
+resetTokenExpira antes de retornar el objeto.
+
+FORMATO DE RESPUESTAS (distinto a los otros módulos)
+──────────────────────────────────────────────────────
+Este módulo usa { success, data, mensaje } en vez de { ok, data, mensaje }.
+Los demás módulos usan { ok, data, mensaje }.
+El frontend debe manejar ambos formatos.
+
+  Éxito:  { "success": true, "data": {...}, "mensaje": "..." }
+  Error:  { "success": false, "error": "...", "code": "..." }
+
+Códigos de error:
+  VALIDATION_ERROR    → 400
+  NOT_FOUND           → 404
+  AUTHENTICATION_ERROR → 401
+  INVALID_ID          → 400
+  DATABASE_ERROR      → 500
+  INTERNAL_ERROR      → 500
+
+ENDPOINTS
+─────────
+
+  Health check (sin auth):
+  ─────────────────────────
+  GET /health
+    Retorna: { "status": "OK", "service": "Usuarios API", "timestamp": "..." }
+    NOTA: este módulo no usa /api/salud sino /health — distinto a los demás.
+
+  Auth (sin auth):
+  ─────────────────
+  POST /api/auth/registro
+    Body (solo estos campos, extras son rechazados por Joi):
+      {
+        "email": "...",       ← requerido, formato email válido
+        "contrasena": "...",  ← requerido, mínimo 6 caracteres
+        "nombres": "..."      ← requerido, mínimo 2 caracteres
+      }
+    Retorna 201:
+      {
+        "success": true,
+        "data": {
+          "usuario": { ...perfilPublico sin contrasena },
+          "token": "eyJ..."
+        },
+        "mensaje": "Usuario registrado correctamente"
+      }
+    Error 400 (email duplicado):
+      { "success": false, "error": "El email ya está registrado", "code": "VALIDATION_ERROR" }
+
+  POST /api/auth/login
+    Body:
+      {
+        "email": "...",      ← requerido
+        "contrasena": "..."  ← requerido
+      }
+    Retorna 200:
+      {
+        "success": true,
+        "data": {
+          "usuario": { ...perfilPublico },
+          "token": "eyJ..."
+        },
+        "mensaje": "Sesión iniciada correctamente"
+      }
+    Error 400: { "success": false, "error": "Credenciales inválidas" }
+    Error 404: { "success": false, "error": "Usuario no encontrado" }
+
+  POST /api/auth/refresh-token
+    Body: { "token": "eyJ..." }
+    Retorna: { "success": true, "data": { "token": "eyJ...nuevo" } }
+    Genera un nuevo token con el mismo usuarioId.
+
+  POST /api/auth/verificar-token
+    Body: { "token": "eyJ..." }
+    Retorna: { "success": true, "data": { "usuarioId": "..." } }
+    Útil para que otros servicios validen tokens sin tener acceso al JWT_SECRET.
+
+  Usuarios (requieren JWT):
+  ─────────────────────────
+  GET /api/usuarios                 ← requiere JWT + tipoUsuario === "admin"
+    Query params: pagina (def:1), limite (def:10, max:100),
+                  tipoUsuario, estadoCuenta, ciudad
+    Retorna:
+      {
+        "success": true,
+        "datos": [ ...usuarios sin campos sensibles ],
+        "paginacion": { "pagina", "limite", "total", "totalPaginas" }
+      }
+
+  GET /api/usuarios/:id             ← requiere JWT (cualquier usuario autenticado)
+    Retorna: { "success": true, "data": { ...perfilPublico } }
+    Error 404: { "success": false, "error": "Usuario no encontrado", "code": "NOT_FOUND" }
+
+  PUT /api/usuarios/:id             ← requiere JWT + ser el mismo usuario o admin
+    Body (solo estos campos permitidos, extras son rechazados):
+      {
+        "nombres": "...",    ← opcional
+        "apellido": "...",   ← opcional
+        "telefono": "...",   ← opcional
+        "ciudad": "...",     ← opcional
+        "edad": 25           ← opcional
+      }
+    NOTA: no se puede cambiar email, contrasena ni tipoUsuario por esta ruta.
+    Retorna: { "success": true, "data": { ...usuarioActualizado }, "mensaje": "..." }
+
+  DELETE /api/usuarios/:id          ← requiere JWT + ser el mismo usuario o admin
+    Retorna: { "success": true, "data": { "mensaje": "Usuario eliminado correctamente" } }
+
+  POST /api/usuarios/:id/cambiar-contrasena  ← requiere JWT + ser el mismo o admin
+    Body:
+      {
+        "contrasenaActual": "...",  ← requerido
+        "contrasenaNueva": "..."    ← requerido
+      }
+    Retorna: { "success": true, "data": { "mensaje": "Contraseña actualizada correctamente" } }
+    Error 400: { "success": false, "error": "Contraseña actual incorrecta" }
+
+  POST /api/usuarios/:id/verificar-email     ← sin auth
+    Body: { "token": "..." }
+    Retorna: { "success": true, "data": { "mensaje": "Email verificado correctamente" } }
+    Error 400: { "success": false, "error": "Token de verificación inválido" }
+
+MIDDLEWARES DE AUTH (propios de este módulo)
+─────────────────────────────────────────────
+  verificarToken     → extrae y valida el JWT, adjunta req.usuarioId y req.usuario
+  verificarAdmin     → consulta la BD para confirmar tipoUsuario === 'admin'
+  verificarPropietario → permite acceso si es el mismo usuario (req.usuarioId === req.params.id)
+                         o si es admin
+
+CONEXIONES CON OTROS MÓDULOS
+─────────────────────────────
+  → No llama a ningún otro módulo
+  ← Módulo admin tiene preparado en httpClient.js el cliente para :5000
+     pero todavía no lo usa en ningún controller activo
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. MÓDULO SERVICIOS (puerto 4002)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+RESPONSABILIDADES
+─────────────────
+  - Catálogo de servicios de barbería (cortes, afeitados, tintes, etc.)
+  - Catálogo de productos a la venta (ceras, champús, etc.)
+  - Gestión de stock de productos
+
+BASE DE DATOS: barbertime_servicios
+────────────────────────────────────
+
+Colección: servicios
+  _id              ObjectId
+  nombre           String  (requerido)
+  descripcion      String  (opcional)
+  precio           Number  (requerido, >= 0)
+  duracionMinutos  Number  (requerido, >= 1) ← CLAVE para el módulo de citas
+  categoria        String  (default: "general")
+  imagen           String  (URL, opcional)
+  activo           Boolean (default: true)
+  createdAt        Date
+  updatedAt        Date
+
+Colección: productos
+  _id          ObjectId
+  nombre       String  (requerido)
+  descripcion  String  (opcional)
+  precio       Number  (requerido, >= 0)
+  stock        Number  (requerido, >= 0, default: 0)
+  marca        String  (opcional)
+  categoria    String  (default: "general")
+  imagen       String  (URL, opcional)
+  activo       Boolean (default: true)
+  createdAt    Date
+  updatedAt    Date
+
+FORMATO DE RESPUESTAS
+──────────────────────
+  Éxito:  { "ok": true, "data": {...} }
+  Error:  { "ok": false, "mensaje": "..." }
+
+ENDPOINTS
+─────────
+
+  Health check (sin auth):
+  GET /api/salud
+    Retorna: { ok: true, servicio: "modulo-servicios", estado: "activo" }
+
+  Servicios (lectura pública, escritura requiere JWT):
+  GET  /api/servicios
+    Query: categoria, activo, page (def:1), limit (def:10)
+    Retorna: { ok, data: [...], paginacion: { total, page, limit, totalPaginas } }
+
+  GET  /api/servicios/:id
+    Retorna: { ok, data: { ...servicio } }
+    Error 404: { ok: false, mensaje: "Servicio no encontrado" }
+
+  POST /api/servicios                ← requiere JWT
+    Body: { nombre*, precio*, duracionMinutos*, descripcion, categoria, imagen, activo }
+    Retorna 201: { ok, data: { ...servicio creado } }
+
+  PUT  /api/servicios/:id            ← requiere JWT
+    Body: cualquier campo (todos opcionales en update)
+    Retorna: { ok, data: { ...servicio actualizado } }
+
+  DELETE /api/servicios/:id          ← requiere JWT
+    Retorna: { ok, mensaje: "Servicio eliminado correctamente" }
+
+  Productos (lectura pública, escritura requiere JWT):
+  GET  /api/productos
+    Query: categoria, marca, activo, page (def:1), limit (def:10)
+    Retorna: { ok, data: [...], paginacion: { total, page, limit, totalPaginas } }
+
+  GET  /api/productos/:id
+    Retorna: { ok, data: { ...producto } }
+
+  POST /api/productos                ← requiere JWT
+    Body: { nombre*, precio*, stock*, descripcion, marca, categoria, imagen, activo }
+    Retorna 201: { ok, data: { ...producto creado } }
+
+  PUT  /api/productos/:id            ← requiere JWT
+    Body: cualquier campo
+    Retorna: { ok, data: { ...producto actualizado } }
+
+  DELETE /api/productos/:id          ← requiere JWT
+    Retorna: { ok, mensaje: "Producto eliminado correctamente" }
+
+CONEXIONES CON OTROS MÓDULOS
+─────────────────────────────
+  ← Frontend lee servicios (público) para mostrar catálogo
+  ← Módulo citas usa duracionMinutos al momento del snapshot
+  ← Módulo admin hace proxy de los endpoints de productos
+  ← Módulo admin/estadisticas/productos consulta catálogo para valor de inventario
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. MÓDULO CITAS (puerto 4003)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+RESPONSABILIDADES
+─────────────────
+  - Agendar citas con verificación de traslape de horarios por barbero
+  - Gestión del ciclo de vida de la cita (máquina de estados)
+  - Guardar snapshot del servicio para preservar precio histórico
+
+MÁQUINA DE ESTADOS
+──────────────────
+  pendiente ──→ confirmada ──→ completada
+      │               │
+      └───────────────┴──→ cancelada
+
+  Reglas:
+    - Solo se puede confirmar desde "pendiente"
+    - Solo se puede completar desde "confirmada"
+    - Se puede cancelar desde "pendiente" o "confirmada"
+    - No se puede modificar (PUT) una cita que no esté en "pendiente"
+    - Solo admin puede hacer DELETE (hard delete)
+
+BASE DE DATOS: barbertime_citas
+────────────────────────────────
+
+Colección: citas
+  _id               ObjectId
+  clienteId         String  (requerido) ← _id del módulo usuarios
+  barberoId         String  (requerido) ← _id del módulo usuarios
+  servicioId        String  (requerido) ← _id del módulo servicios
+  nombreServicio    String  (requerido) ← snapshot en el momento de agendar
+  precioServicio    Number  (requerido) ← snapshot en el momento de agendar
+  duracionMinutos   Number  (requerido) ← snapshot en el momento de agendar
+  fechaHora         Date    (requerido)
+  estado            String  (enum: pendiente|confirmada|cancelada|completada)
+  motivoCancelacion String  (default: "")
+  notas             String  (default: "")
+  createdAt         Date
+  updatedAt         Date
+
+  Índices:
+    { barberoId: 1, fechaHora: 1 }  ← para verificar traslapes
+    { clienteId: 1, fechaHora: -1 } ← para historial del cliente
+
+POR QUÉ SE USA SNAPSHOT
+────────────────────────
+El frontend debe leer el servicio del módulo servicios y copiar
+nombreServicio, precioServicio y duracionMinutos al body del POST /api/citas.
+Si el precio cambia después, la cita conserva el valor original.
+
+FORMATO DE RESPUESTAS
+──────────────────────
+  Éxito:  { "ok": true, "data": {...} }
+  Error:  { "ok": false, "mensaje": "..." }
+
+ENDPOINTS
+─────────
+
+  Health check (sin auth):
+  GET /api/salud
+    Retorna: { ok: true, servicio: "modulo-citas", estado: "activo" }
+
+  CRUD (todas requieren JWT):
+  GET /api/citas
+    Query: clienteId, barberoId, estado, desde (ISO), hasta (ISO),
+           page (def:1), limit (def:10)
+    Retorna: { ok, data: [...], paginacion: { total, page, limit, totalPaginas } }
+    Ejemplo agenda del día:
+      GET /api/citas?barberoId=X&desde=2026-06-10T00:00:00Z&hasta=2026-06-10T23:59:59Z
+
+  GET /api/citas/:id
+    Retorna: { ok, data: { ...cita } }
+    Error 404: { ok: false, mensaje: "Cita no encontrada" }
+
+  POST /api/citas                    ← requiere JWT
+    Body:
+      {
+        "clienteId": "...",           ← requerido (_id del usuario)
+        "barberoId": "...",           ← requerido (_id del barbero)
+        "servicioId": "...",          ← requerido (_id del servicio)
+        "nombreServicio": "...",      ← requerido (snapshot)
+        "precioServicio": 25000,      ← requerido (snapshot)
+        "duracionMinutos": 30,        ← requerido (snapshot)
+        "fechaHora": "ISO string",    ← requerido
+        "notas": "..."                ← opcional
+      }
+    Retorna 201: { ok, data: { ...cita con estado "pendiente" } }
+    Error 409 (traslape):
+      { ok: false, mensaje: "El barbero ya tiene una cita en ese horario",
+        citaExistente: { id, fechaHora, duracionMinutos } }
+
+  PUT /api/citas/:id                 ← requiere JWT, solo si estado = "pendiente"
+    Body: barberoId, servicioId, nombreServicio, precioServicio,
+          duracionMinutos, fechaHora, notas (todos opcionales)
+    Error 400 si no está en "pendiente":
+      { ok: false, mensaje: "No se puede modificar una cita en estado '...'" }
+
+  DELETE /api/citas/:id              ← requiere JWT + tipoUsuario = "admin"
+    Retorna: { ok, mensaje: "Cita eliminada correctamente" }
+
+  Acciones de estado (todas requieren JWT):
+  PATCH /api/citas/:id/confirmar
+    Sin body. Estado requerido: "pendiente"
+    Retorna: { ok, mensaje: "Cita confirmada", data: { ...cita } }
+
+  PATCH /api/citas/:id/cancelar
+    Body: { "motivoCancelacion": "..." } (opcional)
+    Estado requerido: "pendiente" o "confirmada"
+    Retorna: { ok, mensaje: "Cita cancelada", data: { ...cita } }
+
+  PATCH /api/citas/:id/completar
+    Sin body. Estado requerido: "confirmada"
+    Retorna: { ok, mensaje: "Cita marcada como completada", data: { ...cita } }
+
+CONEXIONES CON OTROS MÓDULOS
+─────────────────────────────
+  ← Módulo admin hace proxy de todos los endpoints de citas
+  → No llama a ningún otro módulo directamente
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. MÓDULO ADMIN (puerto 4004)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+RESPONSABILIDADES
+─────────────────
+  - Proxy autenticado hacia módulo servicios (productos) y módulo citas
+  - Gestión de horarios de la barbería y de cada barbero
+  - Registro y consulta de ingresos y gastos
+  - Reportes financieros y estadísticas del negocio
+
+AUTENTICACIÓN
+─────────────
+TODAS las rutas del módulo admin requieren:
+  1. Header: Authorization: Bearer <token>
+  2. Token válido (verificado con JWT_SECRET)
+  3. tipoUsuario === "admin" en el payload del token
+
+  401 → Token no proporcionado / Token inválido o expirado
+  403 → Acceso restringido a administradores
+
+COMPORTAMIENTO PROXY
+─────────────────────
+Las rutas /admin/productos y /admin/citas reenvían la petición al módulo
+correspondiente con el mismo token del admin. Si el módulo destino no está
+disponible retorna 503.
+
+FORMATO DE RESPUESTAS
+──────────────────────
+  Éxito:  { "ok": true, "data": {...} }
+  Error:  { "ok": false, "mensaje": "..." }
+  Error proxy caído: { "ok": false, "mensaje": "Módulo de [x] no disponible al intentar [acción]" }
+
+BASE DE DATOS: barbertime_admin
+────────────────────────────────
+
+Colección: horariosbarberos
+  _id           ObjectId
+  barberoId     String  (requerido)
+  nombreBarbero String  (requerido)
+  diaSemana     Number  (0=Dom...6=Sáb, requerido)
+  horaInicio    String  ("HH:mm", requerido)
+  horaFin       String  ("HH:mm", requerido)
+  descansos     Array   [{ inicio: "HH:mm", fin: "HH:mm" }]
+  activo        Boolean (default: true)
+  Índice único: { barberoId + diaSemana }
+
+Colección: horariobarberias
+  _id          ObjectId
+  diaSemana    Number  (0-6, único)
+  nombreDia    String  (auto generado)
+  horaApertura String  ("HH:mm")
+  horaCierre   String  ("HH:mm")
+  abierto      Boolean (default: true)
+
+Colección: ingresos
+  _id           ObjectId
+  concepto      String  (requerido)
+  monto         Number  (requerido, >= 0)
+  origen        String  (enum: "servicio"|"producto"|"otro", def: "servicio")
+  referenciaId  String  (ID de cita o producto, opcional)
+  barberoId     String  (opcional)
+  nombreBarbero String  (opcional)
+  fecha         Date    (default: ahora)
+  descripcion   String  (default: "")
+
+Colección: gastos
+  _id           ObjectId
+  concepto      String  (requerido)
+  monto         Number  (requerido, >= 0)
+  categoria     String  (enum: "nomina"|"insumos"|"arriendo"|
+                         "servicios_publicos"|"mantenimiento"|"general"|"otro")
+  barberoId     String  (opcional)
+  nombreBarbero String  (opcional)
+  fecha         Date    (default: ahora)
+  descripcion   String  (default: "")
+
+ENDPOINTS
+─────────
+
+  Health check (sin auth):
+  GET /api/salud
+    Retorna: { ok: true, servicio: "modulo-admin", estado: "activo" }
+
+  Proxy Productos (reenvía a :4002):
+  GET    /api/admin/productos
+  GET    /api/admin/productos/:id
+  POST   /api/admin/productos
+  PUT    /api/admin/productos/:id
+  DELETE /api/admin/productos/:id
+  (body y respuestas idénticos al módulo servicios)
+
+  Proxy Citas (reenvía a :4003):
+  GET    /api/admin/citas
+  GET    /api/admin/citas/:id
+  POST   /api/admin/citas
+  PUT    /api/admin/citas/:id
+  DELETE /api/admin/citas/:id
+  PATCH  /api/admin/citas/:id/confirmar
+  PATCH  /api/admin/citas/:id/cancelar
+  PATCH  /api/admin/citas/:id/completar
+  (body y respuestas idénticos al módulo citas)
+
+  Horarios barbería (BD propia):
+  GET  /api/admin/horarios/barberia
+    Retorna: { ok, data: [...7 días ordenados] }
+
+  POST /api/admin/horarios/barberia/inicializar
+    Sin body. Crea los 7 días: Lun-Sáb 08:00-20:00, Dom cerrado.
+    Error 409 si ya existen registros.
+
+  POST /api/admin/horarios/barberia
+    Body: { diaSemana*, horaApertura*, horaCierre*, abierto }
+    Error 409 si ya existe ese día.
+
+  PUT  /api/admin/horarios/barberia/:id
+    Body: cualquier campo
+
+  DELETE /api/admin/horarios/barberia/:id
+
+  Horarios barberos (BD propia):
+  GET  /api/admin/horarios/barberos
+    Query: barberoId, diaSemana, activo
+
+  POST /api/admin/horarios/barberos
+    Body:
+      {
+        "barberoId": "...",       ← requerido
+        "nombreBarbero": "...",   ← requerido
+        "diaSemana": 1,           ← requerido (0-6)
+        "horaInicio": "09:00",    ← requerido
+        "horaFin": "18:00",       ← requerido
+        "descansos": [{ "inicio": "12:00", "fin": "13:00" }], ← opcional
+        "activo": true            ← opcional
+      }
+    Error 409 si ese barbero ya tiene horario ese día.
+
+  PUT  /api/admin/horarios/barberos/:id
+  DELETE /api/admin/horarios/barberos/:id
+
+  Estadísticas — CRUD Ingresos (BD propia):
+  GET /api/admin/estadisticas/ingresos
+    Query: desde, hasta, origen, barberoId, page (def:1), limit (def:20)
+    Retorna: { ok, data: [...], paginacion: {...} }
+
+  POST /api/admin/estadisticas/ingresos
+    Body:
+      {
+        "concepto": "...",         ← requerido
+        "monto": 45000,            ← requerido
+        "origen": "servicio",      ← opcional
+        "referenciaId": "...",     ← opcional (ID de la cita)
+        "barberoId": "...",        ← opcional
+        "nombreBarbero": "...",    ← opcional
+        "fecha": "ISO string",     ← opcional (default: ahora)
+        "descripcion": "..."       ← opcional
+      }
+    Retorna 201: { ok, data: { ...ingreso } }
+
+  DELETE /api/admin/estadisticas/ingresos/:id
+
+  Estadísticas — CRUD Gastos (BD propia):
+  GET /api/admin/estadisticas/gastos
+    Query: desde, hasta, categoria, page (def:1), limit (def:20)
+
+  POST /api/admin/estadisticas/gastos
+    Body:
+      {
+        "concepto": "...",          ← requerido
+        "monto": 1800000,           ← requerido
+        "categoria": "nomina",      ← opcional
+        "barberoId": "...",         ← opcional
+        "nombreBarbero": "...",     ← opcional
+        "fecha": "ISO string",      ← opcional
+        "descripcion": "..."        ← opcional
+      }
+
+  DELETE /api/admin/estadisticas/gastos/:id
+
+  Estadísticas — Reportes (solo GET):
+  GET /api/admin/estadisticas/resumen?desde=...&hasta=...
+    Retorna: { dineroIngresado, cantidadIngresos, dineroQueSale,
+               cantidadGastos, gananciasnetas }
+
+  GET /api/admin/estadisticas/ingresos-por-origen?desde=...&hasta=...
+    Retorna: [ { _id: "servicio", total, cantidad }, ... ]
+
+  GET /api/admin/estadisticas/gastos-por-categoria?desde=...&hasta=...
+    Retorna: [ { _id: "nomina", total, cantidad }, ... ]
+
+  GET /api/admin/estadisticas/barberos?desde=...&hasta=...
+    Retorna por barbero: { barberoId, nombreBarbero, totalIngresos,
+                           totalServicios, totalNomina, rentabilidad }
+
+  GET /api/admin/estadisticas/proyeccion-sueldos?mes=6&anio=2026
+    Promedio de nómina últimos 3 meses.
+    Retorna: { mesProyectado, anioProyectado, totalProyectado,
+               detallePorBarbero: [{ barberoId, nombreBarbero,
+               promedioMensual, totalPagado, cantidadPagos }] }
+
+  GET /api/admin/estadisticas/productos?desde=...&hasta=...
+    Agrega ventas con origen="producto" + llama a módulo servicios para inventario.
+    Retorna: { totalIngresosProductos, ventasPorProducto,
+               catalogoActual: { totalProductosActivos, valorInventario } }
+
+CONEXIONES CON OTROS MÓDULOS
+─────────────────────────────
+  → Módulo servicios :4002  (proxy de productos + consulta inventario)
+  → Módulo citas :4003      (proxy completo de citas)
+  → Módulo usuarios :5000   (preparado en httpClient.js, aún sin usar activamente)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. DIFERENCIAS DE FORMATO ENTRE MÓDULOS (IMPORTANTE PARA EL FRONTEND)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+El módulo de usuarios usa un formato de respuesta diferente al resto:
+
+  Módulo usuarios:
+    Éxito:  { "success": true, "data": {...}, "mensaje": "..." }
+    Error:  { "success": false, "error": "...", "code": "..." }
+    Lista:  { "success": true, "datos": [...], "paginacion": {...} }
+            (ojo: "datos" no "data")
+
+  Módulos servicios, citas y admin:
+    Éxito:  { "ok": true, "data": {...} }
+    Error:  { "ok": false, "mensaje": "..." }
+    Lista:  { "ok": true, "data": [...], "paginacion": {...} }
+
+  El health check también es diferente:
+    Usuarios: GET /health → { "status": "OK", "service": "Usuarios API" }
+    Otros:    GET /api/salud → { "ok": true, "servicio": "...", "estado": "activo" }
+
+Recomendación para el frontend: crear un interceptor de respuestas que normalice
+ambos formatos antes de que lleguen a los componentes. Ejemplo:
+
+  function normalizar(response) {
+    // Módulo usuarios usa "success", los demás usan "ok"
+    const exito = response.data.success ?? response.data.ok ?? false;
+    const datos = response.data.data ?? response.data.datos ?? null;
+    const error = response.data.error ?? response.data.mensaje ?? null;
+    return { exito, datos, error };
+  }
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. FLUJO COMPLETO — AGENDAR Y COBRAR UNA CITA
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Paso 1 — Login del cliente
+  POST :5000/api/auth/login
+  Body: { email, contrasena }
+  Obtiene: { success: true, data: { usuario, token } }
+  El frontend guarda el token. El _id del usuario está en usuario._id.
+
+Paso 2 — Ver servicios disponibles (sin auth)
+  GET :4002/api/servicios
+  El frontend muestra el catálogo. El cliente elige un servicio.
+  Guardar: servicioId (_id), nombreServicio, precioServicio, duracionMinutos.
+
+Paso 3 — Agendar la cita
+  POST :4003/api/citas
+  Header: Authorization: Bearer <token>
+  Body:
+    {
+      "clienteId": "<_id del cliente>",
+      "barberoId": "<_id del barbero>",
+      "servicioId": "<_id del servicio>",
+      "nombreServicio": "<copiado del paso 2>",
+      "precioServicio": 25000,
+      "duracionMinutos": 30,
+      "fechaHora": "2026-06-10T14:00:00.000Z",
+      "notas": "..."
+    }
+  Si hay traslape → 409. Mostrar error y ofrecer otro horario.
+  Si todo bien → 201, cita en estado "pendiente".
+
+Paso 4 — Barbero o admin confirma la cita
+  PATCH :4003/api/citas/:id/confirmar
+  Header: Authorization: Bearer <token del barbero o admin>
+  Sin body. Cita pasa a "confirmada".
+
+Paso 5 — Barbero o admin completa la cita
+  PATCH :4003/api/citas/:id/completar
+  Header: Authorization: Bearer <token>
+  Sin body. Cita pasa a "completada".
+
+Paso 6 — Admin registra el ingreso (MANUAL)
+  POST :4004/api/admin/estadisticas/ingresos
+  Header: Authorization: Bearer <token admin>
+  Body:
+    {
+      "concepto": "Corte clásico",
+      "monto": 25000,
+      "origen": "servicio",
+      "referenciaId": "<_id de la cita>",
+      "barberoId": "<_id del barbero>",
+      "nombreBarbero": "Juan"
+    }
+
+FLUJO DE CANCELACIÓN
+──────────────────────
+  PATCH :4003/api/citas/:id/cancelar
+  Body: { "motivoCancelacion": "..." }
+  Disponible desde "pendiente" o "confirmada".
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+8. VARIABLES DE ENTORNO POR MÓDULO
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Módulo usuarios (.env):
+  PORT=5000
+  MONGODB_URI=mongodb+srv://.../<cluster>/barbertime_usuarios?appName=Cluster0
+  JWT_SECRET=contrasena_servicios
+  JWT_EXPIRY=7d
+  ALLOWED_ORIGINS=http://localhost:3000,http://localhost:5173
+  NODE_ENV=development
+
+  NOTA: este módulo usa MONGODB_URI (con Y) mientras los demás usan MONGO_URI.
+
+Módulo servicios (.env):
+  PORT=4002
+  MONGO_URI=mongodb+srv://.../<cluster>/barbertime_servicios?appName=Cluster0
+  JWT_SECRET=contrasena_servicios
+
+Módulo citas (.env):
+  PORT=4003
+  MONGO_URI=mongodb+srv://.../<cluster>/barbertime_citas?appName=Cluster0
+  JWT_SECRET=contrasena_servicios
+  SERVICIOS_URL=http://localhost:4002
+
+Módulo admin (.env):
+  PORT=4004
+  MONGO_URI=mongodb+srv://.../<cluster>/barbertime_admin?appName=Cluster0
+  JWT_SECRET=contrasena_servicios
+  SERVICIOS_URL=http://localhost:4002
+  CITAS_URL=http://localhost:4003
+  USUARIOS_URL=http://localhost:5000
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+9. ERRORES CONOCIDOS Y CORRECCIONES NECESARIAS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ERROR CRÍTICO 1 — Payload del JWT incompatible (PENDIENTE DE CORREGIR)
+  Problema:
+    El módulo usuarios firma el JWT con { usuarioId } pero los módulos de citas
+    y admin esperan { id, tipoUsuario } en el payload.
+    El módulo admin verifica tipoUsuario === "admin" para dar acceso. Hoy, ese
+    campo no existe en el token que emite el módulo de usuarios, por lo que
+    NINGÚN usuario puede acceder al módulo admin aunque tenga rol admin.
+
+  Corrección en src/services/AuthService.js del módulo usuarios:
+    generarToken(usuarioId, tipoUsuario) {
+        return jwt.sign(
+            { id: usuarioId, tipoUsuario, iat: Date.now() },
+            process.env.JWT_SECRET,
+            { expiresIn: process.env.JWT_EXPIRY || '7d' }
+        );
+    }
+
+    En login():  const token = this.generarToken(usuario._id, usuario.tipoUsuario);
+    En registro(): const token = this.generarToken(usuario._id, usuario.tipoUsuario);
+
+    También actualizar refrescarToken() para mantener el tipoUsuario:
+    refrescarToken(token) {
+        const decoded = this.verificarToken(token);
+        const Usuario = require('../models/Usuario');
+        const usuario = await Usuario.findById(decoded.id);
+        return this.generarToken(decoded.id, usuario.tipoUsuario);
+    }
+
+ERROR CRÍTICO 2 — Nombre del rol barbero inconsistente (PENDIENTE DE CORREGIR)
+  Problema:
+    Módulo usuarios define tipoUsuario con enum: ['cliente', 'admin', 'vendedor']
+    Módulos citas y admin usan 'barbero' como rol esperado.
+    No existe 'barbero' en el módulo de usuarios — un barbero se registraría como
+    'vendedor' y los filtros por tipoUsuario no funcionarían correctamente.
+
+  Corrección en src/models/Usuario.js del módulo usuarios:
+    tipoUsuario: {
+        type: String,
+        enum: ['cliente', 'admin', 'barbero'],  ← cambiar 'vendedor' por 'barbero'
+        default: 'cliente',
+    },
+
+ERROR 3 — Puerto del módulo admin (YA CORREGIDO)
+  El .env del módulo admin traía PORT=4003. Corregido a PORT=4004.
+
+ERROR 4 — Variable MONGO_URI mal nombrada en módulo citas (YA CORREGIDO)
+  El .env tenía MONGODB_URI en vez de MONGO_URI. Corregido.
+
+ERROR 5 — El .env del módulo usuarios está vacío (PENDIENTE)
+  El archivo .env del módulo usuarios no tiene contenido. Debe crearse con:
+    PORT=5000
+    MONGODB_URI=mongodb+srv://user1:contra123@cluster0.<id>.mongodb.net/barbertime_usuarios?appName=Cluster0
+    JWT_SECRET=contrasena_servicios
+    JWT_EXPIRY=7d
+
+PENDIENTE — Registro de ingresos no es automático
+  Cuando una cita se completa, el ingreso NO se registra automáticamente.
+  El admin debe hacer el POST /estadisticas/ingresos de forma manual.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+10. GUÍA PARA EL FRONTEND
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CONFIGURACIÓN BASE RECOMENDADA
+────────────────────────────────
+  const API = {
+    usuarios:  'http://localhost:5000',
+    servicios: 'http://localhost:4002',
+    citas:     'http://localhost:4003',
+    admin:     'http://localhost:4004',
+  }
+
+  const authHeader = () => ({
+    headers: { Authorization: `Bearer ${localStorage.getItem('token')}` }
+  })
+
+VISTAS Y QUÉ MÓDULO CONSUMEN
+──────────────────────────────
+
+  Vista: Login / Registro
+    POST :5000/api/auth/login
+    POST :5000/api/auth/registro
+    Guardar token y usuario en estado global.
+    Redirigir según usuario.tipoUsuario.
+
+  Vista: Catálogo (pública, sin auth)
+    GET :4002/api/servicios
+
+  Vista: Agendar cita (cliente autenticado)
+    GET :4002/api/servicios         ← cargar catálogo
+    POST :4003/api/citas            ← crear cita con snapshot
+    Manejar 409 (traslape).
+
+  Vista: Mis citas (cliente autenticado)
+    GET :4003/api/citas?clienteId=<id>
+    PATCH :4003/api/citas/:id/cancelar
+
+  Vista: Agenda del día (barbero autenticado)
+    GET :4003/api/citas?barberoId=<id>&desde=<hoy 00:00>&hasta=<hoy 23:59>
+    PATCH :4003/api/citas/:id/confirmar
+    PATCH :4003/api/citas/:id/completar
+
+  Vista: Panel admin — citas
+    GET/POST/PUT/DELETE/PATCH :4004/api/admin/citas/...
+
+  Vista: Panel admin — productos
+    GET/POST/PUT/DELETE :4004/api/admin/productos/...
+
+  Vista: Panel admin — horarios
+    GET/POST/PUT :4004/api/admin/horarios/barberia/...
+    GET/POST/PUT :4004/api/admin/horarios/barberos/...
+
+  Vista: Panel admin — estadísticas
+    GET :4004/api/admin/estadisticas/resumen
+    GET :4004/api/admin/estadisticas/barberos
+    GET :4004/api/admin/estadisticas/ingresos-por-origen
+    GET :4004/api/admin/estadisticas/gastos-por-categoria
+    POST :4004/api/admin/estadisticas/ingresos  ← cobro manual
+    POST :4004/api/admin/estadisticas/gastos    ← gasto manual
+
+  Vista: Perfil de usuario
+    GET :5000/api/usuarios/:id
+    PUT :5000/api/usuarios/:id
+    POST :5000/api/usuarios/:id/cambiar-contrasena
+
+  Vista: Admin — gestión de usuarios
+    GET :5000/api/usuarios?tipoUsuario=barbero  ← listar barberos
+    GET :5000/api/usuarios?tipoUsuario=cliente  ← listar clientes
+    DELETE :5000/api/usuarios/:id
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+11. RESUMEN DE PUERTOS, ESTADO Y CORRECCIONES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Puerto 5000 → Módulo usuarios     LISTO — requiere 3 correcciones (ver sección 9)
+  Puerto 4002 → Módulo servicios    LISTO
+  Puerto 4003 → Módulo citas        LISTO
+  Puerto 4004 → Módulo admin        LISTO (puerto corregido)
+  Puerto libre → Frontend           POR DESARROLLAR
+
+CHECKLIST ANTES DE INTEGRAR
+────────────────────────────
+  [ ] Crear .env del módulo usuarios con MONGODB_URI y JWT_SECRET
+  [ ] Corregir payload del JWT en AuthService.js (agregar id y tipoUsuario)
+  [ ] Cambiar 'vendedor' por 'barbero' en el enum tipoUsuario del modelo Usuario
+  [ ] Verificar que todos los módulos tienen el mismo JWT_SECRET
+  [ ] Verificar que el módulo admin tiene PORT=4004 en su .env
+  [ ] Correr npm install en todos los módulos
+  [ ] Inicializar horarios de barbería con POST /api/admin/horarios/barberia/inicializar
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+EOF
+echo "Archivo generado"
+Salida
+
+Archivo generado
+Listo
+
+Se ha quedado sin mensajes gratuitos ha
