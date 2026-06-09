@@ -5,6 +5,40 @@ const HorarioBarberia = require('../models/HorarioBarberia');
 //  HORARIOS DE BARBEROS
 // ══════════════════════════════════════════════════════════
 
+
+
+
+// GET /api/admin/horarios/barberos/lista
+// Devuelve los barberos únicos que tienen al menos un horario registrado.
+// No requiere autenticación (lo usan los clientes para ver disponibilidad).
+const listarBarberos = async (req, res) => {
+  try {
+    const barberos = await HorarioBarbero.aggregate([
+      {
+        $group: {
+          _id: "$barberoId",
+          nombreBarbero: { $first: "$nombreBarbero" },
+        },
+      },
+      { $sort: { nombreBarbero: 1 } },
+    ]);
+
+    return res.json({
+      ok: true,
+      data: barberos.map((b) => ({
+        _id:          b._id,
+        nombreBarbero: b.nombreBarbero,
+      })),
+    });
+  } catch (error) {
+    return res.status(500).json({
+      ok: false,
+      mensaje: "Error al listar barberos",
+      error: error.message,
+    });
+  }
+};
+
 // GET /api/admin/horarios/barberos
 const listarHorariosBarberos = async (req, res) => {
   try {
@@ -205,6 +239,7 @@ const inicializarHorariosBarberia = async (req, res) => {
 
 module.exports = {
   // Barberos
+  listarBarberos, 
   listarHorariosBarberos,
   obtenerHorarioBarbero,
   crearHorarioBarbero,

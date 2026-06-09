@@ -3,6 +3,11 @@ const auth = require('../middlewares/auth');
 const soloAdmin = require('../middlewares/soloAdmin');
 const ctrl = require('../controllers/horariosController');
 
+// ── Ruta pública (sin token) ──────────────────────────────
+router.get('/barberos/lista', ctrl.listarBarberos);
+
+
+
 // Todas las rutas requieren auth + admin
 router.use(auth, soloAdmin);
 
