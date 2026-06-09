@@ -1,8 +1,8 @@
 const axios = require('axios');
 
-const SERVICIOS_URL = process.env.SERVICIOS_URL || 'http://localhost:4002';
-const CITAS_URL = process.env.CITAS_URL || 'http://localhost:4003';
-const USUARIOS_URL = process.env.USUARIOS_URL || 'http://localhost:5000';
+const SERVICIOS_URL = process.env.SERVICIOS_URL || 'https://servicios-main.onrender.com';
+const CITAS_URL = process.env.CITAS_URL || 'https://citas-mvyw.onrender.com';
+const USUARIOS_URL = process.env.USUARIOS_URL || 'https://usuarios-75yj.onrender.com';
 
 // Crea instancia con token del admin para llamadas autenticadas
 const crearCliente = (baseURL, token) => {
